@@ -88,6 +88,11 @@ def parse_arguments(args):
                       metavar="STRICT",
                       help=("Perform strict authentication on the server "
                             "SSL cert"))
+    parser.add_option("--console-type", dest="console_type",
+                      default=None, metavar="CONSOLE_TYPE",
+                      help=("Choose console type between vnc and wsvnc"
+                      "(webvnc)"))
+
 
     (opts, args) = parser.parse_args(args)
 
@@ -102,6 +107,8 @@ def parse_arguments(args):
         parser.error("The --auth-user argument is mandatory.")
     if not opts.auth_password:
         parser.error("The --auth-password argument is mandatory.")
+    if not opts.console_type:
+        parser.error("The --console-type argument is mandatory.")
 
     # Sanity check
     if opts.strict and not opts.ca_cert:
@@ -117,7 +124,7 @@ def request_forwarding(sport, daddr, dport, password,
                        auth_user, auth_password,
                        server_address=DEFAULT_SERVER_ADDRESS,
                        server_port=DEFAULT_SERVER_PORT, no_ssl=False,
-                       ca_cert=None, strict=False):
+                       ca_cert=None, strict=False,console_type='vnc'):
     """Connect to vncauthproxy and request a VNC forwarding."""
     if not password:
         raise ValueError("You must specify a non-empty password")
@@ -129,7 +136,9 @@ def request_forwarding(sport, daddr, dport, password,
         "password": password,
         "auth_user": auth_user,
         "auth_password": auth_password,
+        "console_type": console_type
     }
+    print req["console_type"]
 
     last_error = None
     retries = 5
@@ -192,7 +201,7 @@ if __name__ == '__main__':
                              auth_user=opts.auth_user,
                              auth_password=opts.auth_password,
                              no_ssl=opts.no_ssl, ca_cert=opts.ca_cert,
-                             strict=opts.strict)
+                             strict=opts.strict,console_type=opts.console_type)
 
     reason = None
     if 'reason' in res:
@@ -205,3 +214,6 @@ if __name__ == '__main__':
         sys.exit(0)
     else:
         sys.exit(1)
+
+
+

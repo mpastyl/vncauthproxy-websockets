@@ -92,8 +92,156 @@ try:
 except ImportError:
     from daemon import pidlockfile
 
+from gevent import pywsgi
+from geventwebsocket.handler import WebSocketHandler
+import geventwebsocket
+import base64
+
+from gevent import monkey
+monkey.patch_all()
+
+from gevent.pywsgi import WSGIHandler
+
+from hashlib import md5, sha1
 
 logger = None
+
+
+
+
+class LoggedStream(object):
+    """File-like stream object that redirects all writes to a logger."""
+    def __init__(self, stream, logger, log_level=logging.INFO,
+                 description=""):
+        self.logger = logger
+        self.log_level = log_level
+        self.description = description
+
+        self.original_stream = stream
+
+    def write(self, msg):
+        for line in msg.rstrip().splitlines():
+            self.logger.log(self.log_level, "%s: %s", self.description,
+                            line.rstrip())
+
+    def __getattr__(self, name):
+        return getattr(self.original_stream, name)
+
+
+class LoggedStderr(object):
+    def __init__(self, logger, log_level=logging.INFO, description="stderr"):
+        self.logger = logger
+        self.log_level = log_level
+        self.description = description
+
+        self.original_stderr = sys.stderr
+
+    def __enter__(self):
+        sys.stderr = LoggedStream(sys.stderr, self.logger, self.log_level,
+                                  self.description)
+
+    def __exit__(self, type, value, traceback):
+        sys.stderr = self.original_stderr
+
+
+
+
+class MyWebSocketHybi(geventwebsocket.websocket.WebSocketHybi):
+ 
+   def __init__(self, *args, **kwargs):
+        geventwebsocket.websocket.WebSocketHybi.__init__(self, *args, **kwargs)
+
+
+
+   def recv(self,numb):
+        data  = geventwebsocket.websocket.WebSocketHybi.receive(self)
+        if data != None:
+            return base64.b64decode(data)
+        else:
+            return ''
+
+
+   def send(self,data):
+        data =base64.b64encode(data)
+        geventwebsocket.websocket.WebSocketHybi.send(self,data)
+    
+
+   def sendall(self,data):
+        self.send(data)
+
+class MyWebSocketHandler(WebSocketHandler):
+    
+    def __init__(self, *args, **kwargs):
+        self.status=None
+        WSGIHandler.__init__(self, *args, **kwargs)
+
+    def log_error(self, *args, **kwargs):
+        with LoggedStderr(logger, logging.DEBUG, "WSGIServer stderr"):
+            WebSocketHandler.log_error(self, *args, **kwargs)
+
+
+
+
+
+    def _handle_hybi(self):
+        environ = self.environ
+        version = environ.get("HTTP_SEC_WEBSOCKET_VERSION")
+
+        environ['wsgi.websocket_version'] = 'hybi-%s' % version
+        self.log_error("THIS IS A TEST LOG ERROR")
+        if version not in self.SUPPORTED_VERSIONS:
+            self.log_error('400: Unsupported Version: %r', version)
+            self.respond(
+                '400 Unsupported Version',
+                [('Sec-WebSocket-Version', '13, 8, 7')]
+            )
+            return
+
+        protocol, version = self.request_version.split("/")
+        key = environ.get("HTTP_SEC_WEBSOCKET_KEY")
+
+        # check client handshake for validity
+        if not environ.get("REQUEST_METHOD") == "GET":
+            # 5.2.1 (1)
+            self.respond('400 Bad Request')
+            return
+        elif not protocol == "HTTP":
+            # 5.2.1 (1)
+            self.respond('400 Bad Request')
+            return
+        elif float(version) < 1.1:
+            # 5.2.1 (1)
+            self.respond('400 Bad Request')
+            return
+        # XXX: nobody seems to set SERVER_NAME correctly. check the spec
+        #elif not environ.get("HTTP_HOST") == environ.get("SERVER_NAME"):
+            # 5.2.1 (2)
+            #self.respond('400 Bad Request')
+            #return
+        elif not key:
+            # 5.2.1 (3)
+            self.log_error('400: HTTP_SEC_WEBSOCKET_KEY is missing from request')
+            self.respond('400 Bad Request')
+            return
+        self.websocket = MyWebSocketHybi(self.socket, environ)
+        environ['wsgi.websocket'] = self.websocket
+
+        headers = [
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+            ("Sec-WebSocket-Accept", base64.b64encode(sha1(key + self.GUID).digest())),
+        ]
+        self._send_reply("101 Switching Protocols", headers)
+        return True
+
+
+
+class MyWSGIServer(pywsgi.WSGIServer):
+
+    def log_error(self, *args, **kwargs):
+        with LoggedStderr(logger, logging.DEBUG, "WSGIServer stderr"):
+            pywsgi.WSGIServer.log_error(self, *args, **kwargs)
+
 
 
 class InternalError(Exception):
@@ -151,6 +299,80 @@ class VncAuthProxy(gevent.Greenlet):
         self.dport = None
         self.server = None
         self.password = None
+        self.ws = None
+        self.console_type = None
+        self.websocket_server = None
+        self.no_connection =  True
+
+
+    def __call__(self,environ,start_response):
+
+        try:
+            self.no_connection = False
+            self.workers = []
+            ws = environ['wsgi.websocket']
+            self.ws=ws
+            self._client_handshake()
+            self._start_forwarding()
+        except Exception,e:
+            # Any unhandled exception in the previous block
+            # is an error and must be logged accordingly
+            if not isinstance(e, gevent.GreenletExit):
+                self.exception(e)
+            raise e
+        finally:
+            #self._cleanup()
+            status = '200 OK'
+            self.info(" in finally")
+            headers = [
+                ('Content-Type', 'text/html')
+             ]
+            self.debug("just got in my_app")
+            start_response(status, headers)
+            self.debug("after responce")
+            #return "<p>Hello</p>"
+            #yield "World</p>"
+            return "<meta HTTP-EQUIV=\"REFRESH\" content=\"0; url=https://cyclades.synnefo.live/static/ui/static/snf/extra/noVNC/vnc_auto.html?host=snf-138032.synnefo.live&port=%s&password=%s\">" % (self.sport,self.password) #FIXME hostname parameters are now stated explicitily
+
+    def _start_forwarding(self):
+
+        try:  
+            # Bridge both connections through two "forwarder" greenlets.
+            # This greenlet will wait until any of the workers dies.
+            # Final cleanup will take place in _cleanup().
+            dead = gevent.event.Event()
+            dead.clear()
+
+            # This callback will get called if any of the two workers dies.
+            def callback(g):
+                self.debug("Worker %d/%d died", self.workers.index(g),
+                           len(self.workers))
+                dead.set()
+
+            self.workers.append(gevent.spawn(self._forward,
+                                             self.ws, self.server))
+            self.workers.append(gevent.spawn(self._forward,
+                                             self.server,self.ws))
+            for g in self.workers:
+                g.link(callback)
+
+            # Wait until any of the workers dies
+            self.debug("Waiting for any of %d workers to die",
+                       len(self.workers))
+            dead.wait()
+
+            # We can go now, _cleanup() will take care of
+            # all worker, socket and port cleanup
+            self.debug("A forwarder died, our work here is done")
+            raise gevent.GreenletExit
+        except Exception,e:
+            # Any unhandled exception in the previous block
+            # is an error and must be logged accordingly
+            if not isinstance(e, gevent.GreenletExit):
+                self.exception(e)
+            if self.console_type == 'wsvnc':
+                raise e
+
 
     def _cleanup(self):
         """Cleanup everything: workers, sockets, ports
@@ -168,24 +390,38 @@ class VncAuthProxy(gevent.Greenlet):
         del self.workers
 
         self.debug("Cleaning up sockets")
-        while self.listeners:
-            sock = self.listeners.pop().close()
+        #while self.listeners:
+        #    sock = self.listeners.pop().close()
+        try:
+            if self.server:
+                self.server.close()
 
-        if self.server:
-            self.server.close()
+            if self.client:
+                self.client.close()
 
-        if self.client:
-            self.client.close()
+        
+            self.debug("Stoping web socket server")
+            if self.websocket_server:
+                self.websocket_server.stop()
+                self.websocket_server.kill()
 
+            
+            self.debug("Closing web socket")
+            if self.ws:
+                self.ws.close()   
+        except Exception as err:
+            self.error(err)
         # Reintroduce the port number of the client socket in
         # the port pool, if applicable.
         if not self.pool is None:
             self.pool.append(self.sport)
             self.debug("Returned port %d to port pool, contains %d ports",
                        self.sport, len(self.pool))
+       
 
         self.info("Cleaned up connection, all done")
-        raise gevent.GreenletExit
+        if self.console_type == "wsvnc":
+            raise gevent.GreenletExit
 
     def __str__(self):
         return "VncAuthProxy: %d -> %s:%d" % (self.sport, self.daddr,
@@ -210,9 +446,11 @@ class VncAuthProxy(gevent.Greenlet):
                 else:
                     self.info("Server connection closed")
                 break
-            dest.sendall(d)
-        # No need to close the source and dest sockets here.
-        # They are owned by and will be closed by the original greenlet.
+            dest.sendall(d) 
+
+
+
+
 
     def _perform_server_handshake(self):
         """
@@ -262,7 +500,7 @@ class VncAuthProxy(gevent.Greenlet):
 
         if server is None:
             raise InternalError("Failed to connect to server")
-
+        
         version = server.recv(1024)
         if not rfb.check_version(version):
             raise InternalError("Unsupported RFB version: %s"
@@ -321,6 +559,8 @@ class VncAuthProxy(gevent.Greenlet):
             #         <user for control connection authentication>,
             #      "auth_password":
             #         <password for control connection authentication>,
+            #     "console_type":
+            #         < type of console connection: vnc or websocketvnc(wsvnc)
             # }
             #
             # The <password> is used for MITM authentication of clients
@@ -334,7 +574,7 @@ class VncAuthProxy(gevent.Greenlet):
             #     "status": <one of "OK" or "FAILED">
             # }
             #
-            buf = client.recv(1024)
+            buf = client.recv(2048)
             req = json.loads(buf)
 
             auth_user = req['auth_user']
@@ -343,7 +583,10 @@ class VncAuthProxy(gevent.Greenlet):
             self.daddr = req['destination_address']
             self.dport = int(req['destination_port'])
             self.password = req['password']
+            self.console_type=req['console_type']
+            
 
+            self.debug("cosnole type is %s" % self.console_type)
             if auth_user not in VncAuthProxy.authdb:
                 msg = "Authentication failure: user not found"
                 raise InternalError(msg)
@@ -393,8 +636,9 @@ class VncAuthProxy(gevent.Greenlet):
 
             self.sport = sport
             self.pool = pool
-
-            self.listeners = get_listening_sockets(sport)
+    
+            if self.console_type == 'vnc':
+                self.listeners = get_listening_sockets(sport)
             self._perform_server_handshake()
 
             self.info("New forwarding: %d (client req'd: %d) -> %s:%d",
@@ -449,8 +693,8 @@ class VncAuthProxy(gevent.Greenlet):
         Upon return, self.client socket is connected to the client.
 
         """
-        self.client.send(rfb.RFB_VERSION_3_8 + "\n")
-        client_version_str = self.client.recv(1024)
+        self.ws.send(rfb.RFB_VERSION_3_8 + "\n")
+        client_version_str = self.ws.recv(1024)
         client_version = rfb.check_version(client_version_str)
         if not client_version:
             self.error("Invalid version: %s", client_version_str)
@@ -460,11 +704,11 @@ class VncAuthProxy(gevent.Greenlet):
         self.debug("Requesting authentication")
         auth_request = rfb.make_auth_request(rfb.RFB_AUTHTYPE_VNC,
                                              version=client_version)
-        self.client.send(auth_request)
+        self.ws.send(auth_request)
 
         # The client gets to propose an authtype only for RFB 3.8
         if client_version == rfb.RFB_VERSION_3_8:
-            res = self.client.recv(1024)
+            res = self.ws.recv(1024)
             type = rfb.parse_client_authtype(res)
             if type == rfb.RFB_AUTHTYPE_ERROR:
                 self.warn("Client refused authentication: %s", res[1:])
@@ -473,13 +717,13 @@ class VncAuthProxy(gevent.Greenlet):
 
             if type != rfb.RFB_AUTHTYPE_VNC:
                 self.error("Wrong auth type: %d", type)
-                self.client.send(rfb.to_u32(rfb.RFB_AUTH_ERROR))
+                self.ws.send(rfb.to_u32(rfb.RFB_AUTH_ERROR))
                 raise gevent.GreenletExit
 
         # Generate the challenge
         challenge = os.urandom(16)
-        self.client.send(challenge)
-        response = self.client.recv(1024)
+        self.ws.send(challenge)
+        response = self.ws.recv(1024)
         if len(response) != 16:
             self.error("Wrong response length %d, should be 16", len(response))
             raise gevent.GreenletExit
@@ -488,14 +732,35 @@ class VncAuthProxy(gevent.Greenlet):
             self.debug("Authentication successful")
         else:
             self.warn("Authentication failed")
-            self.client.send(rfb.to_u32(rfb.RFB_AUTH_ERROR))
+            self.ws.send(rfb.to_u32(rfb.RFB_AUTH_ERROR))
             raise gevent.GreenletExit
 
         # Accept the authentication
-        self.client.send(rfb.to_u32(rfb.RFB_AUTH_SUCCESS))
+        self.ws.send(rfb.to_u32(rfb.RFB_AUTH_SUCCESS))
 
+   
+    
     def _proxy(self):
+
+        if self.console_type == 'vnc':
+            self.info("got the connection will be a normal tcp socket connection")
+	    self._dproxy() #call old proxy and continue as before
+        else:
+            server = MyWSGIServer(("", self.sport), self,
+                handler_class=MyWebSocketHandler,keyfile=DEFAULT_KEY_FILE,certfile=DEFAULT_CERT_FILE,server_side=True)
+            self.websocket_server=server
+            self.websocket_server.start()
+            gevent.sleep(DEFAULT_CONNECT_TIMEOUT)
+            if self.no_connection == True :
+                self.info("No incoming connection for %s seconds.Performing cleaup" % DEFAULT_CONNECT_TIMEOUT)
+                self._cleanup()
+        
+    
+    
+    
+    def _dproxy(self):
         try:
+            self.workers = []
             self.info("Waiting for a client to connect at %s",
                       ", ".join(["%s:%d" % s.getsockname()[:2]
                                  for s in self.listeners]))
@@ -515,47 +780,22 @@ class VncAuthProxy(gevent.Greenlet):
                 while self.listeners:
                     sock = self.listeners.pop().close()
                 break
-
+            
+            #we will just treat tcp socket as if it was websocket
+            self.ws=self.client
+            
             # Perform RFB handshake with the client.
             self._client_handshake()
-
-            # Bridge both connections through two "forwarder" greenlets.
-            # This greenlet will wait until any of the workers dies.
-            # Final cleanup will take place in _cleanup().
-            dead = gevent.event.Event()
-            dead.clear()
-
-            # This callback will get called if any of the two workers dies.
-            def callback(g):
-                self.debug("Worker %d/%d died", self.workers.index(g),
-                           len(self.workers))
-                dead.set()
-
-            self.workers.append(gevent.spawn(self._forward,
-                                             self.client, self.server))
-            self.workers.append(gevent.spawn(self._forward,
-                                             self.server, self.client))
-            for g in self.workers:
-                g.link(callback)
-
-            # Wait until any of the workers dies
-            self.debug("Waiting for any of %d workers to die",
-                       len(self.workers))
-            dead.wait()
-
-            # We can go now, _cleanup() will take care of
-            # all worker, socket and port cleanup
-            self.debug("A forwarder died, our work here is done")
-            raise gevent.GreenletExit
+            self._start_forwarding()
         except Exception as err:
             # Any unhandled exception in the previous block
             # is an error and must be logged accordingly
-            if not isinstance(e, gevent.GreenletExit):
-                self.exception(err)
-                self.error("Unexpected error")
+            self.exception(err)
+            self.error("Unexpected error")
             raise err
         finally:
             self._cleanup()
+        
 
     def _run(self):
         self._establish_connection()
@@ -612,7 +852,7 @@ def get_listening_sockets(sport, saddr=None, reuse_addr=False):
                 sock = sockets.pop().close()
 
             # Make sure we fail immediately if we cannot get a socket
-            raise InernalError(err)
+            raise InternalError(err)
 
     return sockets
 
@@ -789,7 +1029,7 @@ def main():
         logger.critical(("Failed to lock PID file %s, another instance "
                          "running?"), pidf.path)
         sys.exit(1)
-    logger.info("Became a daemon")
+    logger.info("Became a daemon!")
 
     # A fork() has occured while daemonizing,
     # we *must* reinit gevent
@@ -824,7 +1064,7 @@ def main():
 
     try:
         sockets = get_listening_sockets(opts.listen_port, opts.listen_address,
-                                        reuse_addr=True)
+                                        reuse_addr=True) 
     except InternalError as err:
         logger.critical("Error binding control socket")
         sys.exit(1)
@@ -839,6 +1079,7 @@ def main():
             rlist, _, _ = select(sockets, [], [])
             for ctrl in rlist:
                 client, _ = ctrl.accept()
+                logger.info("no ssl option is %s"% opts.no_ssl)
                 if not opts.no_ssl:
                     client = ssl.wrap_socket(client,
                                              server_side=True,
@@ -865,3 +1106,6 @@ def main():
 
     daemon_context.close()
     sys.exit(0)
+
+if __name__=="__main__":
+    main()
