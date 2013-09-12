@@ -104,6 +104,7 @@ from gevent.pywsgi import WSGIHandler
 
 from hashlib import md5, sha1
 
+from cgi import parse_qs, escape
 logger = None
 
 
