@@ -317,22 +317,36 @@ class VncAuthProxy(gevent.Greenlet):
         except Exception,e:
             # Any unhandled exception in the previous block
             # is an error and must be logged accordingly
-            if not isinstance(e, gevent.GreenletExit):
-                self.exception(e)
-            raise e
-        finally:
-            #self._cleanup()
-            status = '200 OK'
-            self.info(" in finally")
-            headers = [
-                ('Content-Type', 'text/html')
-             ]
-            self.debug("just got in my_app")
-            start_response(status, headers)
-            self.debug("after responce")
-            #return "<p>Hello</p>"
-            #yield "World</p>"
-            return "<meta HTTP-EQUIV=\"REFRESH\" content=\"0; url=https://cyclades.synnefo.live/static/ui/static/snf/extra/noVNC/vnc_auto.html?host=snf-138032.synnefo.live&port=%s&password=%s\">" % (self.sport,self.password) #FIXME hostname parameters are now stated explicitily
+            #if not isinstance(e, gevent.GreenletExit):
+            #    self.exception(e)
+            #raise e
+            if isinstance(e, gevent.GreenletExit):
+                self._cleanup()
+                raise e
+            else:
+                self.dummy_connection = True
+                status = '200 OK'
+                self.info(" in finally")
+
+                d = parse_qs(environ['QUERY_STRING'])
+                target = d.get('target', [''])[0]
+                target = escape (target)
+                host = d.get('host', [''])[0]
+                host = escape (host)
+                password = d.get('password',[''])[0]
+                password = escape(password)
+                port = d.get('port',[''])[0]
+                port = escape(port)
+
+                headers = [
+                    ('Content-Type', 'text/html')
+                ]
+                self.debug("just got in my_app")
+                start_response(status, headers)
+                self.debug("after responce")
+                #return "<p>Hello</p>"
+                #yield "World</p>"
+                return "<meta HTTP-EQUIV=\"REFRESH\" content=\"0; url=https://%s/static/ui/static/snf/extra/noVNC/vnc_auto.html?host=%s&port=%s&password=%s\">" % (target,host,port,password)
 
     def _start_forwarding(self):
 
